@@ -1,0 +1,552 @@
+clear
+close all
+clc
+
+rng('default') % For reproducibility
+
+script_path = fileparts(mfilename('fullpath'));
+addpath(genpath(fullfile(script_path, 'utils')))
+
+% Search dataset files by name instead of relying on a fixed data folder.
+data_search_roots = {
+    fullfile(script_path, 'data')
+    script_path
+    pwd
+    fileparts(script_path)
+    fileparts(fileparts(script_path))
+};
+
+%% ============================================================
+% 1. Dataset list
+% =============================================================
+Data_list = {
+     'MSRCv1.mat'
+%     'Mfeat.mat'
+%     'CCV.mat'
+%   'MNIST-4.mat'
+%   'Hdigit.mat'
+%     'ORL.mat'
+    % 'BDG2.mat'
+};
+
+%% ============================================================
+% 2. Result save path
+% =============================================================
+savepath = fullfile(script_path, 'result');
+if ~exist(savepath, 'dir')
+    mkdir(savepath);
+end
+
+%% ============================================================
+% 3. Fixed parameters
+% =============================================================
+opts_base = [];
+opts_base.maxIter = 200;
+
+opts_base.theta_rate = 2;
+opts_base.mu_rate    = 2;
+opts_base.nb_num     = 8;
+opts_base.yita       = 1e-2;
+opts_base.theta      = 1e-4;
+opts_base.mu         = 1e-4;
+
+%% ============================================================
+% 4. Hyperparameter search space
+% =============================================================
+% lamda1_list = [0.01, 0.1, 1, 10, 100, 1000];
+% lamda2_list = [10, 100, 1e3, 1e4, 1e5, 1e6];
+lamda1_list = [10];
+lamda2_list = [10];
+% m_list depends on cls_num, so it is generated for each dataset.
+m_multiplier_list = [4];
+
+num_repeat = 10;
+
+%% ============================================================
+% 5. Result table header
+% =============================================================
+result_header = {
+    'Dataset', 'ViewNum', 'ClsNum', ...
+    'lamda1', 'lamda2', 'm', 'd', ...
+    'ACC', 'NMI', 'PUR', 'AR', 'Recall', 'Precision', 'FScore', ...
+    'stdACC', 'stdNMI', 'stdPUR', 'stdAR', 'stdRecall', 'stdPrecision', 'stdFScore', ...
+    'Time', 'Status'
+};
+
+all_records = {};
+best_records = {};
+
+%% ============================================================
+% 6. Iterate over all datasets
+% =============================================================
+for data_index = 1:numel(Data_list)
+
+    Data_name = Data_list{data_index};
+
+    fprintf('\n====================================================\n');
+    fprintf('Running dataset: %s\n', Data_name);
+    fprintf('====================================================\n');
+
+    %% ------------------------------------------------------------
+    % 6.1 Load data
+    % -------------------------------------------------------------
+    data_file = find_dataset_file(Data_name, data_search_roots);
+
+    if ~exist(data_file, 'file')
+        fprintf('Data file does not exist, skipped: %s\n', Data_name);
+        continue;
+    end
+
+    Data = load(data_file);
+
+    %% ------------------------------------------------------------
+    % 6.2 Automatically read X and labels
+    % -------------------------------------------------------------
+    if isfield(Data, 'X')
+        X_raw = Data.X;
+    elseif isfield(Data, 'data')
+        X_raw = Data.data;
+    else
+        error('Dataset %s does not contain variable X or data.', Data_name);
+    end
+
+    if isfield(Data, 'Y')
+        gt = Data.Y;
+    elseif isfield(Data, 'y')
+        gt = Data.y;
+    elseif isfield(Data, 'gt')
+        gt = Data.gt;
+    elseif isfield(Data, 'truelabel')
+        if iscell(Data.truelabel)
+            gt = Data.truelabel{1};
+        else
+            gt = Data.truelabel;
+        end
+    else
+        error('Dataset %s does not contain label variable Y / y / gt / truelabel.', Data_name);
+    end
+
+    if iscell(gt)
+        gt = gt{1};
+    end
+
+    gt = double(gt(:));
+
+    K = length(X_raw);                % number of views
+    cls_num = length(unique(gt));     % number of clusters
+    n = length(gt);                   % number of samples
+
+    %% ------------------------------------------------------------
+    % 6.3 Align each view orientation and normalize data
+    % -------------------------------------------------------------
+    X = cell(1, K);
+
+    for k = 1:K
+
+        Xi = X_raw{k};
+        Xi = full(double(Xi));
+
+        % Convert to d_i x n format
+        if size(Xi, 1) == n
+            Xi = Xi';
+        elseif size(Xi, 2) == n
+            % Already in d_i x n format; no transpose needed
+        else
+            error('View %d in dataset %s has dimensions that do not match the number of labels.', k, Data_name);
+        end
+
+        X{k} = NormalizeData(Xi);
+
+    end
+
+    %% ------------------------------------------------------------
+    % 6.4 m_list for the current dataset
+    % -------------------------------------------------------------
+    m_list = cls_num * m_multiplier_list;
+
+    total_experiments = numel(lamda1_list) * numel(lamda2_list) * numel(m_list);
+
+    fprintf('Views: %d, samples: %d, clusters: %d\n', K, n, cls_num);
+    fprintf('Total experiments for current dataset: %d\n', total_experiments);
+
+    dataset_records = {};
+    exp_count = 0;
+
+    %% ------------------------------------------------------------
+    % 6.5 Iterate over hyperparameters
+    % -------------------------------------------------------------
+    for lamda1_index = 1:numel(lamda1_list)
+        for lamda2_index = 1:numel(lamda2_list)
+            for m_index = 1:numel(m_list)
+
+                exp_count = exp_count + 1;
+
+                lamda1 = lamda1_list(lamda1_index);
+                lamda2 = lamda2_list(lamda2_index);
+                m = m_list(m_index);
+                d = m;
+
+                opts = opts_base;
+                opts.lamda1 = lamda1;
+                opts.lamda2 = lamda2;
+                opts.m = m;
+                opts.d = d;
+
+                fprintf('\n[%d/%d] Dataset=%s, lamda1=%.4g, lamda2=%.4g, m=%d, d=%d\n', ...
+                    exp_count, total_experiments, Data_name, lamda1, lamda2, m, d);
+
+                t_start = tic;
+
+                try
+
+                    %% ------------------------------------------------
+                    % Run PRTL
+                    % -------------------------------------------------
+                    [Z, obj, history] =train(X, cls_num, gt, opts);
+                    Time = toc(t_start);
+
+                    %% ------------------------------------------------
+                    % Construct fused similarity matrix S
+                    % -------------------------------------------------
+                    S = 0;
+
+                    for k = 1:K
+                        S = S + Z{k}' * Z{k};
+                    end
+
+                    S = S / K;
+                    S = (S + S') / 2;
+
+                    %% ------------------------------------------------
+                    % Repeated spectral clustering evaluation
+                    % -------------------------------------------------
+                    Fi = zeros(num_repeat, 1);
+                    Pi = zeros(num_repeat, 1);
+                    Ri = zeros(num_repeat, 1);
+                    nmi1 = zeros(num_repeat, 1);
+                    avgenti = zeros(num_repeat, 1);
+                    ACCi = zeros(num_repeat, 1);
+                    PURi = zeros(num_repeat, 1);
+                    ARi = zeros(num_repeat, 1);
+                    RIi = zeros(num_repeat, 1);
+                    MIi = zeros(num_repeat, 1);
+                    HIi = zeros(num_repeat, 1);
+
+                    for q = 1:num_repeat
+
+                        [C, XY] = SpectralClustering(S, cls_num);
+
+                        [Fi(q), Pi(q), Ri(q)] = compute_f(gt, C);
+                        [~, nmi1(q), avgenti(q)] = compute_nmi(gt, C);
+                        ACCi(q) = Accuracy(C, double(gt));
+                        [~, ~, PURi(q)] = purity(gt, C);
+
+                        if min(gt) == 0
+                            [ARi(q), RIi(q), MIi(q), HIi(q)] = RandIndex(gt + 1, C);
+                        else
+                            [ARi(q), RIi(q), MIi(q), HIi(q)] = RandIndex(gt, C);
+                        end
+
+                    end
+
+                    %% ------------------------------------------------
+                    % Compute mean values
+                    % -------------------------------------------------
+                    ACC = mean(ACCi);
+                    NMI = mean(nmi1);
+                    PUR = mean(PURi);
+                    AR = mean(ARi);
+                    Recall = mean(Ri);
+                    Precision = mean(Pi);
+                    FScore = mean(Fi);
+
+                    %% ------------------------------------------------
+                    % Compute standard deviations
+                    % -------------------------------------------------
+                    stdACC = std(ACCi);
+                    stdNMI = std(nmi1);
+                    stdPUR = std(PURi);
+                    stdAR = std(ARi);
+                    stdRecall = std(Ri);
+                    stdPrecision = std(Pi);
+                    stdFScore = std(Fi);
+
+                    status = 'OK';
+
+                    %% ------------------------------------------------
+                    % Print means and standard deviations
+                    % Format: ACC=mean(std)
+                    % -------------------------------------------------
+                    fprintf(['ACC=%.4f(%.4f), NMI=%.4f(%.4f), PUR=%.4f(%.4f), ', ...
+                             'AR=%.4f(%.4f), Recall=%.4f(%.4f), Precision=%.4f(%.4f), ', ...
+                             'FScore=%.4f(%.4f), Time=%.2f\n'], ...
+                        ACC, stdACC, ...
+                        NMI, stdNMI, ...
+                        PUR, stdPUR, ...
+                        AR, stdAR, ...
+                        Recall, stdRecall, ...
+                        Precision, stdPrecision, ...
+                        FScore, stdFScore, ...
+                        Time);
+
+                catch ME
+
+                    Time = toc(t_start);
+
+                    ACC = NaN;
+                    NMI = NaN;
+                    PUR = NaN;
+                    AR = NaN;
+                    Recall = NaN;
+                    Precision = NaN;
+                    FScore = NaN;
+
+                    stdACC = NaN;
+                    stdNMI = NaN;
+                    stdPUR = NaN;
+                    stdAR = NaN;
+                    stdRecall = NaN;
+                    stdPrecision = NaN;
+                    stdFScore = NaN;
+
+                    status = ['ERROR: ', ME.message];
+
+                    fprintf('Current experiment failed: %s\n', ME.message);
+
+                end
+
+                %% ----------------------------------------------------
+                % Record current result
+                % -----------------------------------------------------
+                one_record = {
+                    Data_name, K, cls_num, ...
+                    lamda1, lamda2, m, d, ...
+                    ACC, NMI, PUR, AR, Recall, Precision, FScore, ...
+                    stdACC, stdNMI, stdPUR, stdAR, stdRecall, stdPrecision, stdFScore, ...
+                    Time, status
+                };
+
+                dataset_records(end + 1, :) = one_record;
+                all_records(end + 1, :) = one_record;
+
+            end
+        end
+    end
+
+    %% ------------------------------------------------------------
+    % 6.6 Save all results for the current dataset: txt, xlsx, mat
+    % -------------------------------------------------------------
+    dataset_table = cell2table(dataset_records, 'VariableNames', result_header);
+
+    [~, data_base_name, ~] = fileparts(Data_name);
+
+    mat_file = fullfile(savepath, ['result_', data_base_name, '.mat']);
+    txt_file = fullfile(savepath, ['result_', data_base_name, '.txt']);
+    xlsx_file = fullfile(savepath, ['result_', data_base_name, '.xlsx']);
+
+    save(mat_file, ...
+        'dataset_table', ...
+        'lamda1_list', ...
+        'lamda2_list', ...
+        'm_multiplier_list', ...
+        'opts_base');
+
+    dataset_export_table = format_MSRCV_export_table(dataset_table);
+    writetable(dataset_export_table, txt_file, 'Delimiter', '\t');
+    if exist(xlsx_file, 'file')
+        delete(xlsx_file);
+    end
+    writetable(dataset_export_table, xlsx_file, 'Sheet', 'AllResults');
+
+    fprintf('\nAll results for current dataset have been saved:\n');
+    fprintf('MAT : %s\n', mat_file);
+    fprintf('TXT : %s\n', txt_file);
+    fprintf('XLSX: %s\n', xlsx_file);
+
+    %% ------------------------------------------------------------
+    % 6.7 Save the best result for the current dataset: txt, xlsx, mat
+    % Select the best parameters by maximum ACC by default
+    % -------------------------------------------------------------
+    ok_idx = strcmp(dataset_table.Status, 'OK');
+
+    if any(ok_idx)
+
+        ok_rows = find(ok_idx);
+        [~, best_local_idx] = max(dataset_table.ACC(ok_idx));
+        best_row_idx = ok_rows(best_local_idx);
+
+        best_result = dataset_table(best_row_idx, :);
+
+        best_records(end + 1, :) = table2cell(best_result);
+
+        best_mat_file = fullfile(savepath, ['result_', data_base_name, '_best.mat']);
+        best_txt_file = fullfile(savepath, ['result_', data_base_name, '_best.txt']);
+        best_xlsx_file = fullfile(savepath, ['result_', data_base_name, '_best.xlsx']);
+
+        save(best_mat_file, 'best_result');
+        best_export_table = format_MSRCV_export_table(best_result);
+        writetable(best_export_table, best_txt_file, 'Delimiter', '\t');
+        if exist(best_xlsx_file, 'file')
+            delete(best_xlsx_file);
+        end
+        writetable(best_export_table, best_xlsx_file, 'Sheet', 'BestResult');
+
+        fprintf('\nBest result for current dataset has been saved:\n');
+        fprintf('MAT : %s\n', best_mat_file);
+        fprintf('TXT : %s\n', best_txt_file);
+        fprintf('XLSX: %s\n', best_xlsx_file);
+
+        fprintf('\nBest result for current dataset:\n');
+        fprintf(['Dataset=%s, ACC=%.4f(%.4f), NMI=%.4f(%.4f), PUR=%.4f(%.4f), ', ...
+                 'AR=%.4f(%.4f), FScore=%.4f(%.4f), lamda1=%.4g, lamda2=%.4g, m=%d\n'], ...
+            best_result.Dataset{1}, ...
+            best_result.ACC, best_result.stdACC, ...
+            best_result.NMI, best_result.stdNMI, ...
+            best_result.PUR, best_result.stdPUR, ...
+            best_result.AR, best_result.stdAR, ...
+            best_result.FScore, best_result.stdFScore, ...
+            best_result.lamda1, best_result.lamda2, best_result.m);
+
+    else
+
+        fprintf('\nNo experiment completed successfully for current dataset, so no best result is available.\n');
+
+    end
+
+end
+
+%% ============================================================
+% 7. Save all dataset results: txt, xlsx, mat
+% =============================================================
+if ~isempty(all_records)
+
+    all_table = cell2table(all_records, 'VariableNames', result_header);
+
+    all_mat_file = fullfile(savepath, 'result_ALL.mat');
+    all_txt_file = fullfile(savepath, 'result_ALL.txt');
+    all_xlsx_file = fullfile(savepath, 'result_ALL.xlsx');
+
+    save(all_mat_file, ...
+        'all_table', ...
+        'Data_list', ...
+        'lamda1_list', ...
+        'lamda2_list', ...
+        'm_multiplier_list', ...
+        'opts_base');
+
+    all_export_table = format_MSRCV_export_table(all_table);
+    writetable(all_export_table, all_txt_file, 'Delimiter', '\t');
+    if exist(all_xlsx_file, 'file')
+        delete(all_xlsx_file);
+    end
+    writetable(all_export_table, all_xlsx_file, 'Sheet', 'AllResults');
+
+    fprintf('\nAll dataset results have been saved:\n');
+    fprintf('MAT : %s\n', all_mat_file);
+    fprintf('TXT : %s\n', all_txt_file);
+    fprintf('XLSX: %s\n', all_xlsx_file);
+
+end
+
+%% ============================================================
+% 8. Save all best dataset results: txt, xlsx, mat
+% =============================================================
+if ~isempty(best_records)
+
+    best_table = cell2table(best_records, 'VariableNames', result_header);
+
+    best_all_mat_file = fullfile(savepath, 'result_ALL_best.mat');
+    best_all_txt_file = fullfile(savepath, 'result_ALL_best.txt');
+    best_all_xlsx_file = fullfile(savepath, 'result_ALL_best.xlsx');
+
+    save(best_all_mat_file, 'best_table');
+
+    best_all_export_table = format_MSRCV_export_table(best_table);
+    writetable(best_all_export_table, best_all_txt_file, 'Delimiter', '\t');
+    if exist(best_all_xlsx_file, 'file')
+        delete(best_all_xlsx_file);
+    end
+    writetable(best_all_export_table, best_all_xlsx_file, 'Sheet', 'BestResult');
+
+    fprintf('\nAll best dataset results have been saved:\n');
+    fprintf('MAT : %s\n', best_all_mat_file);
+    fprintf('TXT : %s\n', best_all_txt_file);
+    fprintf('XLSX: %s\n', best_all_xlsx_file);
+
+    fprintf('\nSummary of all best dataset results:\n');
+
+    for i = 1:height(best_table)
+        fprintf(['Dataset=%s, ACC=%.4f(%.4f), NMI=%.4f(%.4f), PUR=%.4f(%.4f), ', ...
+                 'AR=%.4f(%.4f), FScore=%.4f(%.4f), lamda1=%.4g, lamda2=%.4g, m=%d\n'], ...
+            best_table.Dataset{i}, ...
+            best_table.ACC(i), best_table.stdACC(i), ...
+            best_table.NMI(i), best_table.stdNMI(i), ...
+            best_table.PUR(i), best_table.stdPUR(i), ...
+            best_table.AR(i), best_table.stdAR(i), ...
+            best_table.FScore(i), best_table.stdFScore(i), ...
+            best_table.lamda1(i), best_table.lamda2(i), best_table.m(i));
+    end
+
+end
+
+fprintf('\n====================================================\n');
+fprintf('All experiments completed. Results have been saved to the result folder.\n');
+fprintf('====================================================\n');
+
+function T = format_MSRCV_export_table(T)
+    format_cols = {
+        'ACC', 'NMI', 'PUR', 'Purity', 'AR', 'ARI', 'Recall', 'Precision', ...
+        'FScore', 'Fscore', 'Entropy', ...
+        'stdACC', 'stdNMI', 'stdPUR', 'stdPurity', 'stdAR', 'stdARI', ...
+        'stdRecall', 'stdPrecision', 'stdFScore', 'stdFscore', 'stdEntropy', ...
+        'Time'
+    };
+
+    for ci = 1:numel(format_cols)
+        col = format_cols{ci};
+        if ismember(col, T.Properties.VariableNames) && isnumeric(T.(col))
+            T.(col) = arrayfun(@(x) sprintf('%.15g', x), T.(col), 'UniformOutput', false);
+        end
+    end
+end
+
+function data_file = find_dataset_file(Data_name, search_roots)
+    data_file = '';
+
+    % 1) Try direct locations first.
+    for ri = 1:numel(search_roots)
+        root_i = search_roots{ri};
+        if isempty(root_i) || ~exist(root_i, 'dir')
+            continue;
+        end
+
+        candidate_file = fullfile(root_i, Data_name);
+        if exist(candidate_file, 'file')
+            data_file = candidate_file;
+            return;
+        end
+    end
+
+    % 2) Search recursively. This avoids depending on a fixed folder name.
+    for ri = 1:numel(search_roots)
+        root_i = search_roots{ri};
+        if isempty(root_i) || ~exist(root_i, 'dir')
+            continue;
+        end
+
+        file_list = dir(fullfile(root_i, '**', Data_name));
+        file_list = file_list(~[file_list.isdir]);
+
+        if ~isempty(file_list)
+            data_file = fullfile(file_list(1).folder, file_list(1).name);
+
+            if numel(file_list) > 1
+                fprintf('Multiple files named %s were found. Using: %s\n', Data_name, data_file);
+            else
+                fprintf('Loaded dataset file: %s\n', data_file);
+            end
+
+            return;
+        end
+    end
+end
