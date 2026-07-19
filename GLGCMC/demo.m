@@ -60,7 +60,7 @@ lamda2_list = [10];
 % m_list depends on cls_num, so it is generated for each dataset.
 m_multiplier_list = [4];
 
-num_repeat = 10;
+num_repeat = 20;
 
 %% ============================================================
 % 5. Result table header
